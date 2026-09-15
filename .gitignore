@@ -16,3 +16,7 @@ logs/
 
 # Playwright
 .playwright/
+
+# Диагностические дампы страниц (содержат личные данные пассажира)
+debug_*.html
+debug_*.png

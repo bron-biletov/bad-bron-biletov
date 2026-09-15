@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
@@ -26,6 +27,43 @@ def _require(d: Dict[str, Any], key: str, context: str) -> Any:
     if key not in d or d[key] in (None, ""):
         raise ConfigError(f"В секции '{context}' отсутствует обязательное поле '{key}'")
     return d[key]
+
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _optional_str(d: Dict[str, Any], key: str, context: str) -> Optional[str]:
+    """Достаёт необязательное строковое поле, приводя число к строке.
+
+    Нужно из-за того, что YAML 1.1 разбирает значения без кавычек как числа —
+    например, `train_number: 876Щ` без кавычек ещё сойдёт за строку (в ней
+    есть буква), но `departure_time: 19:38` без кавычек PyYAML понимает как
+    шестидесятеричное число 1178, а не как строку "19:38". Без явного
+    приведения к str такие значения потом никогда не совпадают с текстом,
+    считанным со страницы, и поиск рейса молча не находит ничего подходящего.
+    """
+    value = d.get(key)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(
+            f"Поле '{context}.{key}' задано без кавычек, из-за чего YAML прочитал его "
+            f"как число ({value!r}), а не как строку — вероятно, значение будет "
+            f'никогда не совпадать с данными сайта. Возьмите значение в кавычки, '
+            f'например: {key}: "19:38"'
+        )
+    return value
+
+
+def _validate_time_format(value: Optional[str], context: str, key: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not _TIME_RE.match(value):
+        raise ConfigError(
+            f"Поле '{context}.{key}' должно быть в формате ЧЧ:ММ (например \"19:38\"), "
+            f"получено {value!r}"
+        )
+    return value
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -55,14 +93,17 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     route_raw = raw.get("route", {})
+    departure_time = _validate_time_format(
+        _optional_str(route_raw, "departure_time", "route"), "route", "departure_time"
+    )
     route = RouteQuery(
         from_station=_require(route_raw, "from_station", "route"),
         to_station=_require(route_raw, "to_station", "route"),
         date=_require(route_raw, "date", "route"),
         from_esr=str(route_raw["from_esr"]) if route_raw.get("from_esr") else None,
         to_esr=str(route_raw["to_esr"]) if route_raw.get("to_esr") else None,
-        train_number=route_raw.get("train_number"),
-        departure_time=route_raw.get("departure_time"),
+        train_number=_optional_str(route_raw, "train_number", "route"),
+        departure_time=departure_time,
         car_type=route_raw.get("car_type"),
     )
 
