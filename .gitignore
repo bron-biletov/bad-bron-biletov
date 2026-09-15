@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Секреты и данные пользователя — никогда не коммитить
+config.yaml
+config.local.yaml
+*.env
+.env
+
+# Состояние сессии браузера (куки авторизации) и логи
+storage_state.json
+logs/
+*.log
+
+# Playwright
+.playwright/
