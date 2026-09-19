@@ -82,6 +82,7 @@ class Poller:
             except Exception as exc:  # noqa: BLE001
                 self._consecutive_errors += 1
                 logger.exception("Непредвиденная ошибка во время опроса: %s", exc)
+                await rw_site._dump_debug_state(page, "unexpected_error")
 
             if once:
                 return booked

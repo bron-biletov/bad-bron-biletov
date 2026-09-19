@@ -27,6 +27,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
@@ -37,6 +39,24 @@ from .models import Passenger, RouteQuery, TrainMatch
 logger = logging.getLogger("bron_biletov")
 
 BASE_URL = "https://pass.rw.by"
+
+
+async def _dump_debug_state(page: Page, label: str) -> None:
+    """Сохраняет HTML и скриншот текущей страницы при сбое шага бронирования.
+
+    Это единственный способ разобрать причину сбоя без ручного повторения
+    диагностики: следующий провал сам оставит снимок состояния страницы —
+    достаточно прочитать debug_<label>_*.html/.png в корне проекта.
+    Никогда не выбрасывает исключение — диагностика не должна ронять бота.
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = Path(f"debug_{label}_{timestamp}")
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        base.with_suffix(".html").write_text(await page.content(), encoding="utf-8")
+        logger.info("Сохранён диагностический снимок: %s.html / %s.png", base, base)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Не удалось сохранить диагностический снимок: %s", exc)
 
 # --- Кандидаты локаторов для формы входа -----------------------------------
 # Подтверждено вживую (headless-прогон против реального сайта, 2026-09-15):
@@ -249,13 +269,15 @@ async def _select_document_type(page: Page, document_type: str) -> bool:
 async def _check_agreement_checkbox(page: Page) -> bool:
     """Отмечает чекбокс согласия с правилами.
 
-    Подтверждено вживую: обычный `check()` виснет по таймауту (элемент не
-    проходит проверку actionability — визуально скрыт стилями
-    `jquery.formstyler`), а `check(force=True)` формально "кликает", но не
-    меняет состояние (Playwright явно детектирует это и бросает отдельную
-    ошибку — не таймаут). Поэтому переключаем состояние напрямую через JS,
-    минуя хиткест по координатам клика, и дополнительно рассылаем события
-    "click"/"change", которые слушает JS-валидация формы.
+    Подтверждено вживую (дамп debug_passenger_form_*): чекбокс оформлен
+    через виджет jQuery formstyler — реальный `<input>` обёрнут в
+    `<div class="jq-checkbox ..."><input .../><div class="jq-checkbox__div">
+    </div></div>`, и именно эта обёртка визуально кликабельна (то, что видит
+    и по чему кликает настоящий пользователь). Прямое присвоение
+    `input.checked` через JS не работает надёжно, так как formstyler
+    отслеживает клики по обёртке и сам управляет синхронизацией состояния —
+    его внутренняя модель не в курсе внешнего изменения. Поэтому кликаем по
+    обёртке, как это делает браузер при реальном клике, а не по `<input>`.
     """
     checkbox = page.locator(AGREEMENT_CHECKBOX_SELECTOR).first
     if await checkbox.count() == 0:
@@ -266,6 +288,27 @@ async def _check_agreement_checkbox(page: Page) -> bool:
     except PWTimeoutError:
         pass
 
+    wrapper = page.locator("div.jq-checkbox").filter(
+        has=page.locator(AGREEMENT_CHECKBOX_SELECTOR)
+    ).first
+    if await wrapper.count() > 0:
+        try:
+            # Обычный клик по координатам почти наверняка попадёт в сам
+            # <input> — он визуально скрыт (opacity:0), но по факту лежит
+            # поверх обёртки в том же месте. Это вызовет ОДНОВРЕМЕННО и
+            # нативный тоггл чекбокса браузером, и обработчик клика на
+            # обёртке у formstyler — если тот тоже переключает состояние
+            # безусловно, оба переключения гасят друг друга (подтверждено
+            # тестом). Программный `el.click()` через JS всегда бьёт точно
+            # по обёртке независимо от геометрии/наложения, без гонки.
+            await wrapper.evaluate("el => el.click()")
+            if await checkbox.is_checked():
+                return True
+        except PWTimeoutError:
+            pass
+
+    # Фолбэк на случай, если formstyler для этого чекбокса не
+    # инициализировался и обёртки нет (обычный необёрнутый <input>).
     try:
         await checkbox.evaluate(
             "el => { el.checked = true; "
@@ -592,6 +635,7 @@ async def book_train(page: Page, match: TrainMatch, passenger: Passenger, car_ty
     await dismiss_known_overlays(page)
 
     if not await _select_car_type_and_carriage(page, car_type):
+        await _dump_debug_state(page, "car_type_carriage")
         raise SiteInteractionError(
             "Не удалось выбрать тип вагона/вагон на странице /ru/order/places/. "
             "Проверьте CAR_TYPE_ITEM_SELECTOR / CARRIAGE_ACCORDION_HEADER_SELECTOR "
@@ -613,6 +657,7 @@ async def book_train(page: Page, match: TrainMatch, passenger: Passenger, car_ty
         if PASSENGERS_URL_FRAGMENT in page.url:
             break
         if await auth_modal.count() > 0 and await auth_modal.is_visible():
+            await _dump_debug_state(page, "session_expired")
             raise SiteInteractionError(
                 "Сайт снова показал форму входа при переходе к данным пассажиров — "
                 "сессия авторизации, похоже, истекла или недействительна."
@@ -644,6 +689,7 @@ async def book_train(page: Page, match: TrainMatch, passenger: Passenger, car_ty
     agreed = await _check_agreement_checkbox(page)
 
     if not all([filled_last, filled_first, filled_doc_number, selected_doc_type, agreed]):
+        await _dump_debug_state(page, "passenger_form")
         raise SiteInteractionError(
             "Не удалось полностью заполнить форму пассажира "
             f"(фамилия={filled_last}, имя={filled_first}, номер документа={filled_doc_number}, "
@@ -662,6 +708,7 @@ async def book_train(page: Page, match: TrainMatch, passenger: Passenger, car_ty
             timeout=8000,
         )
     except PWTimeoutError:
+        await _dump_debug_state(page, "submit_disabled")
         raise SiteInteractionError(
             "Кнопка 'Оформить заказ' осталась disabled после заполнения формы — "
             "вероятно, какое-то обязательное поле не прошло JS-валидацию "
@@ -672,6 +719,7 @@ async def book_train(page: Page, match: TrainMatch, passenger: Passenger, car_ty
 
     confirmed = await _click_robust(submit_button, timeout=8000)
     if not confirmed:
+        await _dump_debug_state(page, "submit_click")
         raise SiteInteractionError("Не удалось нажать кнопку 'Оформить заказ'")
 
     try:
